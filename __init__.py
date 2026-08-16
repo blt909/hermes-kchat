@@ -13,9 +13,9 @@ kChat (Infomaniak's Mattermost) has two incompatibilities with the bundled
 adapter:
 
 1. Post ``props`` validation. kChat validates ``props`` as a JSON array and
-   rejects the standard object form with HTTP 422 ("The props must be an
-   array"). The bundled adapter unconditionally injects
-   ``props={"disable_mentions": true}`` on every outbound post, so ALL posts
+   rejects the standard object form with HTTP 422 (\"The props must be an
+   array\"). The bundled adapter unconditionally injects
+   ``props={\"disable_mentions\": true}`` on every outbound post, so ALL posts
    fail on kChat — cron delivery included. We neutralise that injection.
 
 2. WebSocket support. kChat does not expose ``/api/v4/websocket`` (HTTP 404
@@ -34,6 +34,15 @@ the corresponding patch detects it and leaves the module untouched.
 Because this plugin lives in ``~/.hermes/plugins/`` (outside the git repo),
 a ``hermes update`` that reverts or changes the bundled adapter cannot
 remove it — the patches re-apply on the next gateway start.
+
+v1.0.1: also patch ``_ws_connect_and_listen``.  The ``_ws_loop`` patch alone
+is fragile against gateway initialisation order: if ``register()`` runs
+after the instance's WebSocket task was created, the already-bound coroutine
+keeps using the native loop and the 404 fallback never engages.  Patching
+``_ws_connect_and_listen`` (resolved on every call, including from the
+native loop) makes the fallback engage no matter when ``register()`` ran.
+All diagnostics logs bumped to WARNING so the plugin's activity is visible
+in gateway.log/errors.log (INFO from this logger was not captured).
 """
 
 import asyncio
@@ -189,6 +198,42 @@ def _make_ws_loop_polling_aware(adapter_cls):
     adapter_cls._hermes_kchat_polling_patched = True
 
 
+def _make_ws_connect_polling_aware(adapter_cls):
+    """Replace ``_ws_connect_and_listen`` so a 404 engages polling.
+
+    Unlike the ``_ws_loop`` patch, this one is also effective when the
+    plugin's ``register()`` runs *after* the instance's WebSocket task was
+    created: the native loop resolves ``self._ws_connect_and_listen()`` on
+    every reconnect attempt, so the next attempt hits the patched method,
+    sees the 404, and hands control to the polling loop (which never
+    returns until shutdown).
+    """
+    if getattr(adapter_cls, "_hermes_kchat_ws_connect_patched", False):
+        return
+    original = adapter_cls._ws_connect_and_listen
+    adapter_log = logging.getLogger(_MODULE_NAME)
+
+    async def _ws_connect_and_listen_patched(self):
+        import aiohttp
+        try:
+            await original(self)
+        except asyncio.CancelledError:
+            raise
+        except aiohttp.WSServerHandshakeError as exc:
+            if getattr(exc, "status", None) == 404:
+                adapter_log.warning(
+                    "Mattermost: WS connect 404 (%s) — engaging REST polling "
+                    "fallback (kChat compatibility plugin)",
+                    exc,
+                )
+                await _polling_fallback_loop(self)
+                return
+            raise
+
+    adapter_cls._ws_connect_and_listen = _ws_connect_and_listen_patched
+    adapter_cls._hermes_kchat_ws_connect_patched = True
+
+
 # ---------------------------------------------------------------------------
 # Module loading / patching
 # ---------------------------------------------------------------------------
@@ -245,7 +290,7 @@ def _load_adapter_module():
 
 
 def register(ctx):
-    """Apply both kChat compatibility patches to the Mattermost adapter."""
+    """Apply the kChat compatibility patches to the Mattermost adapter."""
     del ctx  # unused; loading the module is the whole job
 
     mod = _load_adapter_module()
@@ -260,18 +305,18 @@ def register(ctx):
     if not getattr(mod, "_hermes_kchat_props_patched", False):
         original = getattr(mod, "_with_mentions_disabled", None)
         if original is None:
-            log.info(
+            log.warning(
                 "hermes-kchat: adapter has no _with_mentions_disabled; "
                 "props patch skipped (upstream may have fixed it)"
             )
         elif getattr(original, "_hermes_kchat_noop", False):
-            log.info("hermes-kchat: props patch already applied")
+            log.warning("hermes-kchat: props patch already applied")
             setattr(mod, "_hermes_kchat_props_patched", True)
         else:
             mod._with_mentions_disabled = _noop_with_mentions_disabled
             _noop_with_mentions_disabled._hermes_kchat_noop = True
             setattr(mod, "_hermes_kchat_props_patched", True)
-            log.info(
+            log.warning(
                 "hermes-kchat: patched _with_mentions_disabled → no-op "
                 "(kChat props-array compatibility)"
             )
@@ -283,5 +328,15 @@ def register(ctx):
             "hermes-kchat: MattermostAdapter class not found; "
             "polling fallback NOT applied"
         )
-    else:
-        _make_ws_loop_polling_aware(adapter_cls)
+        return
+
+    _make_ws_loop_polling_aware(adapter_cls)
+    # v1.0.1: also patch _ws_connect_and_listen so the fallback engages even
+    # when the instance's WS task was already created before register() ran.
+    _make_ws_connect_polling_aware(adapter_cls)
+    log.warning(
+        "hermes-kchat: polling fallback armed (_ws_loop=%s, "
+        "_ws_connect_and_listen=%s)",
+        adapter_cls._ws_loop.__name__,
+        adapter_cls._ws_connect_and_listen.__name__,
+    )
