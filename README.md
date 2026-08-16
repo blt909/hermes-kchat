@@ -86,7 +86,7 @@ global home channel (each cron job targets its own channel via
 
 ## Compatibility
 
-Tested against Hermes Agent commit `56dc01d` (August 2026). The patches are
+Tested against Hermes Agent commit `06b91411` (v0.20.2, August 2026). The patches are
 fail-open, but the adapter's method names can change across versions — if a
 Hermes update changes the adapter, re-test.
 
