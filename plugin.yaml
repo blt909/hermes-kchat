@@ -1,4 +1,4 @@
 name: hermes-kchat
-version: "1.0.1"
-description: Make the Mattermost adapter compatible with Infomaniak kChat (props must be an array; the disable_mentions dict is rejected with HTTP 422; WS 404 → REST polling armed on _ws_connect_and_listen too, timing-safe).
+version: "1.0.2"
+description: Make the Mattermost adapter compatible with Infomaniak kChat (props must be an array; the disable_mentions dict is rejected with HTTP 422; timing-safe WS 404 → REST polling, auto re-patched on every adapter import to survive loader eviction).
 author: Sébastien Coget (blt909)

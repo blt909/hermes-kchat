@@ -35,17 +35,23 @@ Because this plugin lives in ``~/.hermes/plugins/`` (outside the git repo),
 a ``hermes update`` that reverts or changes the bundled adapter cannot
 remove it — the patches re-apply on the next gateway start.
 
-v1.0.1: also patch ``_ws_connect_and_listen``.  The ``_ws_loop`` patch alone
-is fragile against gateway initialisation order: if ``register()`` runs
-after the instance's WebSocket task was created, the already-bound coroutine
-keeps using the native loop and the 404 fallback never engages.  Patching
-``_ws_connect_and_listen`` (resolved on every call, including from the
-native loop) makes the fallback engage no matter when ``register()`` ran.
-All diagnostics logs bumped to WARNING so the plugin's activity is visible
-in gateway.log/errors.log (INFO from this logger was not captured).
+v1.0.1: also patch ``_ws_connect_and_listen`` — the attribute is resolved on
+every call (including from the native reconnect loop), so the fallback
+engages even if ``register()`` runs after the instance's WS task was created.
+
+v1.0.2: survive adapter re-import. The v0.20.2 plugin loader
+(``_load_directory_module``) evicts stale ``sys.modules`` entries for a
+platform slug BEFORE loading it. Because user plugins are loaded BEFORE
+bundled platform plugins, the loader purged the very adapter module this
+plugin had patched and re-imported a pristine copy — the patches silently
+vanished every boot. A meta-path finder now re-applies the patches after
+EVERY real import of ``hermes_plugins.mattermost_platform.adapter``, so they
+survive any loader order. All diagnostics logs are WARNING so the plugin's
+activity is visible in gateway.log/errors.log.
 """
 
 import asyncio
+import importlib.abc
 import json
 import logging
 import os
@@ -60,6 +66,7 @@ log = logging.getLogger(__name__)
 _PKG_NAME = "hermes_plugins.mattermost_platform"
 _MODULE_NAME = _PKG_NAME + ".adapter"
 _POLL_INTERVAL_S = 30
+_FINDER_INSTALLED = False
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +241,118 @@ def _make_ws_connect_polling_aware(adapter_cls):
     adapter_cls._hermes_kchat_ws_connect_patched = True
 
 
+def _apply_adapter_patches(mod):
+    """Apply all kChat patches to an adapter module (idempotent, fail-open)."""
+    props_done = False
+    if not getattr(mod, "_hermes_kchat_props_patched", False):
+        original = getattr(mod, "_with_mentions_disabled", None)
+        if original is None:
+            log.warning(
+                "hermes-kchat: adapter has no _with_mentions_disabled; "
+                "props patch skipped (upstream may have fixed it)"
+            )
+        elif getattr(original, "_hermes_kchat_noop", False):
+            setattr(mod, "_hermes_kchat_props_patched", True)
+            props_done = True
+        else:
+            mod._with_mentions_disabled = _noop_with_mentions_disabled
+            _noop_with_mentions_disabled._hermes_kchat_noop = True
+            setattr(mod, "_hermes_kchat_props_patched", True)
+            props_done = True
+            log.warning(
+                "hermes-kchat: patched _with_mentions_disabled → no-op "
+                "(kChat props-array compatibility)"
+            )
+
+    adapter_cls = getattr(mod, "MattermostAdapter", None)
+    if adapter_cls is None:
+        log.warning(
+            "hermes-kchat: MattermostAdapter class not found; "
+            "polling fallback NOT applied"
+        )
+        return
+
+    _make_ws_loop_polling_aware(adapter_cls)
+    _make_ws_connect_polling_aware(adapter_cls)
+    log.warning(
+        "hermes-kchat: polling fallback armed (_ws_loop=%s, "
+        "_ws_connect_and_listen=%s)",
+        adapter_cls._ws_loop.__name__,
+        adapter_cls._ws_connect_and_listen.__name__,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auto re-patch on import (v1.0.2)
+#
+# The plugin loader in Hermes v0.20.2 evicts sys.modules entries for a
+# platform slug before loading it. User plugins load BEFORE bundled
+# platform plugins, so the adapter module this plugin patched gets purged
+# and re-imported pristine on every boot. A meta-path finder intercepts the
+# real import of the adapter and re-applies the patches right after the
+# module executes — whatever the loader order.
+# ---------------------------------------------------------------------------
+
+
+class _AdapterAutoPatchLoader(importlib.abc.Loader):
+    """Wrap the real adapter loader; re-apply patches after exec."""
+
+    def __init__(self, original):
+        self._orig = original
+
+    def create_module(self, spec):
+        if hasattr(self._orig, "create_module"):
+            return self._orig.create_module(spec)
+        return None  # default module creation
+
+    def exec_module(self, module):
+        self._orig.exec_module(module)
+        try:
+            _apply_adapter_patches(module)
+        except Exception:
+            log.warning(
+                "hermes-kchat: auto re-patch after import failed",
+                exc_info=True,
+            )
+
+    def __getattr__(self, name):
+        # Forward any other loader API the import machinery may ask for.
+        return getattr(self._orig, name)
+
+
+class _AdapterAutoPatchFinder(importlib.abc.MetaPathFinder):
+    """Intercept imports of the Mattermost adapter to re-apply patches."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _MODULE_NAME:
+            return None
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is not None:
+                spec = find_spec(fullname, path, target)
+            else:
+                legacy = getattr(finder, "find_module", None)
+                spec = legacy(fullname, path) if legacy else None
+            if spec is not None:
+                if spec.loader is not None:
+                    spec.loader = _AdapterAutoPatchLoader(spec.loader)
+                return spec
+        return None
+
+
+def _install_auto_patch_finder():
+    """Install the meta-path finder once, at the front of sys.meta_path."""
+    global _FINDER_INSTALLED
+    if _FINDER_INSTALLED:
+        return
+    # Front of the chain so we can wrap the spec before PathFinder imports
+    # the module outright.
+    sys.meta_path.insert(0, _AdapterAutoPatchFinder())
+    _FINDER_INSTALLED = True
+
+
 # ---------------------------------------------------------------------------
 # Module loading / patching
 # ---------------------------------------------------------------------------
@@ -290,53 +409,22 @@ def _load_adapter_module():
 
 
 def register(ctx):
-    """Apply the kChat compatibility patches to the Mattermost adapter."""
+    """Apply the kChat compatibility patches to the Mattermost adapter.
+
+    Installs the auto re-patch import hook first (so patches survive the
+    loader's later eviction+re-import of the platform module), then patches
+    the adapter module if it is already importable.
+    """
     del ctx  # unused; loading the module is the whole job
+
+    _install_auto_patch_finder()
 
     mod = _load_adapter_module()
     if mod is None:
         log.warning(
             "hermes-kchat: could not locate Mattermost adapter; "
-            "patches NOT applied"
+            "patches will apply on next import (auto-patch finder armed)"
         )
         return
 
-    # Patch 1: props injection → no-op
-    if not getattr(mod, "_hermes_kchat_props_patched", False):
-        original = getattr(mod, "_with_mentions_disabled", None)
-        if original is None:
-            log.warning(
-                "hermes-kchat: adapter has no _with_mentions_disabled; "
-                "props patch skipped (upstream may have fixed it)"
-            )
-        elif getattr(original, "_hermes_kchat_noop", False):
-            log.warning("hermes-kchat: props patch already applied")
-            setattr(mod, "_hermes_kchat_props_patched", True)
-        else:
-            mod._with_mentions_disabled = _noop_with_mentions_disabled
-            _noop_with_mentions_disabled._hermes_kchat_noop = True
-            setattr(mod, "_hermes_kchat_props_patched", True)
-            log.warning(
-                "hermes-kchat: patched _with_mentions_disabled → no-op "
-                "(kChat props-array compatibility)"
-            )
-
-    # Patch 2: WebSocket 404 → REST polling fallback
-    adapter_cls = getattr(mod, "MattermostAdapter", None)
-    if adapter_cls is None:
-        log.warning(
-            "hermes-kchat: MattermostAdapter class not found; "
-            "polling fallback NOT applied"
-        )
-        return
-
-    _make_ws_loop_polling_aware(adapter_cls)
-    # v1.0.1: also patch _ws_connect_and_listen so the fallback engages even
-    # when the instance's WS task was already created before register() ran.
-    _make_ws_connect_polling_aware(adapter_cls)
-    log.warning(
-        "hermes-kchat: polling fallback armed (_ws_loop=%s, "
-        "_ws_connect_and_listen=%s)",
-        adapter_cls._ws_loop.__name__,
-        adapter_cls._ws_connect_and_listen.__name__,
-    )
+    _apply_adapter_patches(mod)
