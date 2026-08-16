@@ -1,0 +1,287 @@
+# hermes-kchat — compatibility patches for Hermes Agent's Mattermost adapter
+# Copyright (c) 2026 Sébastien Coget (blt909)
+# SPDX-License-Identifier: MIT
+#
+# This plugin patches, at runtime, the bundled Mattermost adapter of Hermes
+# Agent (https://github.com/NousResearch/hermes-agent — MIT License,
+# Copyright (c) 2025 Nous Research). It contains no copied code from that
+# project; it is interface-coupled to the adapter's method names and to the
+# Mattermost WebSocket event shape. See NOTICE.md for full attribution.
+"""Make the Mattermost adapter compatible with Infomaniak kChat.
+
+kChat (Infomaniak's Mattermost) has two incompatibilities with the bundled
+adapter:
+
+1. Post ``props`` validation. kChat validates ``props`` as a JSON array and
+   rejects the standard object form with HTTP 422 ("The props must be an
+   array"). The bundled adapter unconditionally injects
+   ``props={"disable_mentions": true}`` on every outbound post, so ALL posts
+   fail on kChat — cron delivery included. We neutralise that injection.
+
+2. WebSocket support. kChat does not expose ``/api/v4/websocket`` (HTTP 404
+   on connect), so the adapter's WebSocket listener can never attach and its
+   reconnect loop spams ``Mattermost WS error: 404`` forever. Inbound
+   messages (DMs, @mentions) are never received. We add a REST polling
+   fallback: when the WebSocket handshake fails with 404, we switch to
+   polling ``/api/v4/channels/{id}/posts?since=`` every 30 seconds and feed
+   the posts through the exact same ``_handle_ws_event`` → ``handle_message``
+   pipeline the WebSocket would have used (mention gating, dedup, file
+   download, thread resolution all preserved).
+
+Both patches are idempotent and fail open: if upstream fixes either issue,
+the corresponding patch detects it and leaves the module untouched.
+
+Because this plugin lives in ``~/.hermes/plugins/`` (outside the git repo),
+a ``hermes update`` that reverts or changes the bundled adapter cannot
+remove it — the patches re-apply on the next gateway start.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import types
+from importlib import util as _importlib_util
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+_PKG_NAME = "hermes_plugins.mattermost_platform"
+_MODULE_NAME = _PKG_NAME + ".adapter"
+_POLL_INTERVAL_S = 30
+
+
+# ---------------------------------------------------------------------------
+# Patch 1: mentions-disable props injection (kChat rejects dict props)
+# ---------------------------------------------------------------------------
+
+
+def _noop_with_mentions_disabled(payload):
+    """Return the payload untouched.
+
+    kChat rejects dict ``props`` with HTTP 422. Omitting ``props`` is valid
+    on both standard Mattermost and kChat, so a no-op is the compatible
+    behaviour.
+    """
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Patch 2: REST polling fallback when the WebSocket is unavailable (404)
+# ---------------------------------------------------------------------------
+
+
+async def _polling_fallback_loop(self):
+    """Poll all channels the bot is in every _POLL_INTERVAL_S seconds.
+
+    Feeds new posts into ``_handle_ws_event`` — the same pipeline the
+    WebSocket listener uses — so mention gating, dedup, file downloads and
+    thread resolution behave identically.
+    """
+    adapter_log = logging.getLogger(_MODULE_NAME)
+    since_map = {}  # channel_id -> ms timestamp of last processed post
+
+    async def _poll_once():
+        channels = await self._api_get("users/me/channels")
+        if not isinstance(channels, list):
+            return
+        now_ms = int(time.time() * 1000)
+        for ch in channels:
+            ch_id = ch.get("id")
+            if not ch_id:
+                continue
+            ch_type = ch.get("type", "O")
+            if ch_id in since_map:
+                since = since_map[ch_id]
+            else:
+                # First cycle: anchor on the channel's most recent post's
+                # create_at (server clock). The host clock can be skewed vs
+                # the server (observed ~70s on kChat); using local time as
+                # `since` would skip every post newer than the skew.
+                anchor = await self._api_get(
+                    f"channels/{ch_id}/posts?per_page=1"
+                )
+                a_posts = anchor.get("posts") or {}
+                if a_posts:
+                    since = max(
+                        (p.get("create_at") or 0) for p in a_posts.values()
+                    )
+                else:
+                    since = now_ms
+            data = await self._api_get(
+                f"channels/{ch_id}/posts?since={since}&per_page=50"
+            )
+            order = data.get("order") or []
+            posts = data.get("posts") or {}
+            max_create = since
+            for pid in order:
+                post = posts.get(pid)
+                if not post:
+                    continue
+                create_at = post.get("create_at") or 0
+                if create_at > max_create:
+                    max_create = create_at
+                # Reuse the exact WebSocket event shape the adapter parses.
+                event = {
+                    "event": "posted",
+                    "data": {
+                        "post": json.dumps(post),
+                        "channel_type": ch_type,
+                        "sender_name": "",
+                    },
+                }
+                try:
+                    await self._handle_ws_event(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    adapter_log.warning(
+                        "Mattermost polling: error handling post %s: %s",
+                        pid, exc,
+                    )
+            since_map[ch_id] = max_create + 1
+
+    adapter_log.warning(
+        "Mattermost: WebSocket unavailable — REST polling fallback active "
+        "(%ds interval)",
+        _POLL_INTERVAL_S,
+    )
+    while not self._closing:
+        try:
+            await _poll_once()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            adapter_log.warning("Mattermost polling error: %s", exc)
+        try:
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+
+
+def _make_ws_loop_polling_aware(adapter_cls):
+    """Replace ``_ws_loop`` so a 404 handshake switches to REST polling.
+
+    Any other failure delegates to the original loop (backoff, auth-stop).
+    """
+    if getattr(adapter_cls, "_hermes_kchat_polling_patched", False):
+        return
+    original_ws_loop = adapter_cls._ws_loop
+
+    async def _ws_loop_patched(self):
+        import aiohttp
+        try:
+            await self._ws_connect_and_listen()
+        except asyncio.CancelledError:
+            return
+        except aiohttp.WSServerHandshakeError as exc:
+            if getattr(exc, "status", None) == 404:
+                # kChat: no WebSocket endpoint. Poll instead of retrying.
+                await _polling_fallback_loop(self)
+                return
+        except Exception:
+            pass  # any other failure → original reconnect loop
+        await original_ws_loop(self)
+
+    adapter_cls._ws_loop = _ws_loop_patched
+    adapter_cls._hermes_kchat_polling_patched = True
+
+
+# ---------------------------------------------------------------------------
+# Module loading / patching
+# ---------------------------------------------------------------------------
+
+
+def _candidate_dirs():
+    """Return likely locations of the bundled Mattermost adapter directory."""
+    dirs = []
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        dirs.append(Path(env_home) / "hermes-agent" / "plugins" / "platforms" / "mattermost")
+    dirs.append(Path.home() / ".hermes" / "hermes-agent" / "plugins" / "platforms" / "mattermost")
+    return dirs
+
+
+def _load_adapter_module():
+    """Return the adapter module, loading it by path if not yet imported."""
+    mod = sys.modules.get(_MODULE_NAME)
+    if mod is not None:
+        return mod
+
+    for pkg_dir in _candidate_dirs():
+        adapter_py = pkg_dir / "adapter.py"
+        init_py = pkg_dir / "__init__.py"
+        if not (adapter_py.is_file() and init_py.is_file()):
+            continue
+
+        # Ensure the namespace parent package exists so the gateway's later
+        # ``from .adapter import register`` reuses this exact module instead
+        # of re-importing the file.
+        if _PKG_NAME not in sys.modules:
+            parent = types.ModuleType(_PKG_NAME)
+            parent.__path__ = [str(pkg_dir)]
+            parent.__package__ = _PKG_NAME
+            sys.modules[_PKG_NAME] = parent
+
+        spec = _importlib_util.spec_from_file_location(_MODULE_NAME, adapter_py)
+        if spec is None or spec.loader is None:
+            continue
+        mod = _importlib_util.module_from_spec(spec)
+        sys.modules[_MODULE_NAME] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:  # pragma: no cover - defensive
+            log.warning(
+                "hermes-kchat: failed to exec adapter from %s",
+                adapter_py,
+                exc_info=True,
+            )
+            sys.modules.pop(_MODULE_NAME, None)
+            return None
+        return mod
+    return None
+
+
+def register(ctx):
+    """Apply both kChat compatibility patches to the Mattermost adapter."""
+    del ctx  # unused; loading the module is the whole job
+
+    mod = _load_adapter_module()
+    if mod is None:
+        log.warning(
+            "hermes-kchat: could not locate Mattermost adapter; "
+            "patches NOT applied"
+        )
+        return
+
+    # Patch 1: props injection → no-op
+    if not getattr(mod, "_hermes_kchat_props_patched", False):
+        original = getattr(mod, "_with_mentions_disabled", None)
+        if original is None:
+            log.info(
+                "hermes-kchat: adapter has no _with_mentions_disabled; "
+                "props patch skipped (upstream may have fixed it)"
+            )
+        elif getattr(original, "_hermes_kchat_noop", False):
+            log.info("hermes-kchat: props patch already applied")
+            setattr(mod, "_hermes_kchat_props_patched", True)
+        else:
+            mod._with_mentions_disabled = _noop_with_mentions_disabled
+            _noop_with_mentions_disabled._hermes_kchat_noop = True
+            setattr(mod, "_hermes_kchat_props_patched", True)
+            log.info(
+                "hermes-kchat: patched _with_mentions_disabled → no-op "
+                "(kChat props-array compatibility)"
+            )
+
+    # Patch 2: WebSocket 404 → REST polling fallback
+    adapter_cls = getattr(mod, "MattermostAdapter", None)
+    if adapter_cls is None:
+        log.warning(
+            "hermes-kchat: MattermostAdapter class not found; "
+            "polling fallback NOT applied"
+        )
+    else:
+        _make_ws_loop_polling_aware(adapter_cls)
