@@ -52,8 +52,8 @@ jobs:
             rm -rf "$HERMES_HOME/hermes-agent"
             if git clone --quiet --no-checkout --no-tags \
                   https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent" \
-               && git -C "$HERMES_HOME/hermes-agent" fetch --quiet --depth 1 origin "${{ steps.ref.outputs.sha }}" \
-               && git -C "$HERMES_HOME/hermes-agent" checkout --quiet "${{ steps.ref.outputs.sha }}"; then
+               && git -C "$HERMES_HOME/hermes-agent" fetch --quiet --depth 1 origin "${{ steps.ref.outputs.sha }}"; then
+              git -C "$HERMES_HOME/hermes-agent" checkout --quiet "${{ steps.ref.outputs.sha }}"
               exit 0
             fi
             echo "hermes-agent checkout attempt $i failed (transient GitHub RPC?) — retrying in 5s"
