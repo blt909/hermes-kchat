@@ -48,6 +48,11 @@ vanished every boot. A meta-path finder now re-applies the patches after
 EVERY real import of ``hermes_plugins.mattermost_platform.adapter``, so they
 survive any loader order. All diagnostics logs are WARNING so the plugin's
 activity is visible in gateway.log/errors.log.
+
+v1.0.3: no runtime changes — repository tooling only. Adds the test suite
+(unit + functional, incl. the loader-eviction regression test), GitHub
+Actions CI (unit, functional against the README-pinned hermes-agent commit,
+daily drift with auto-PR), and the update watcher.
 """
 
 import asyncio
