@@ -46,10 +46,20 @@ jobs:
         env:
           HERMES_HOME: ${{ github.workspace }}/hermes-home
         run: |
-          git clone --quiet --no-checkout --no-tags \
-            https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent"
-          git -C "$HERMES_HOME/hermes-agent" fetch --quiet --depth 1 origin "${{ steps.ref.outputs.sha }}"
-          git -C "$HERMES_HOME/hermes-agent" checkout --quiet "${{ steps.ref.outputs.sha }}"
+          # GitHub sometimes 429s unauthenticated git RPCs — retry, the
+          # alternative is a flaky CI (or a false drift alarm).
+          for i in 1 2 3; do
+            rm -rf "$HERMES_HOME/hermes-agent"
+            if git clone --quiet --no-checkout --no-tags \
+                  https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent" \
+               && git -C "$HERMES_HOME/hermes-agent" fetch --quiet --depth 1 origin "${{ steps.ref.outputs.sha }}" \
+               && git -C "$HERMES_HOME/hermes-agent" checkout --quiet "${{ steps.ref.outputs.sha }}"; then
+              exit 0
+            fi
+            echo "hermes-agent checkout attempt $i failed (transient GitHub RPC?) — retrying in 5s"
+            sleep 5
+          done
+          exit 1
       - name: Install deps
         run: pip install pytest aiohttp pyyaml python-dotenv
       - name: Test
@@ -71,8 +81,16 @@ jobs:
         env:
           HERMES_HOME: ${{ github.workspace }}/hermes-home
         run: |
-          git clone --quiet --depth 1 \
-            https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent"
+          for i in 1 2 3; do
+            rm -rf "$HERMES_HOME/hermes-agent"
+            if git clone --quiet --depth 1 \
+                  https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent"; then
+              exit 0
+            fi
+            echo "hermes-agent clone attempt $i failed (transient GitHub RPC?) — retrying in 5s"
+            sleep 5
+          done
+          exit 1
       - name: Install deps
         run: pip install pytest aiohttp pyyaml python-dotenv
       - name: Test
