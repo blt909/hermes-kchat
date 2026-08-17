@@ -90,6 +90,30 @@ Tested against Hermes Agent commit `06b91411` (v0.20.2, August 2026). The patche
 fail-open, but the adapter's method names can change across versions — if a
 Hermes update changes the adapter, re-test.
 
+## Testing
+
+Unit tests run standalone; functional tests need a hermes-agent checkout
+(resolved automatically from `$HERMES_HOME/hermes-agent` or
+`~/.hermes/hermes-agent`):
+
+```bash
+pip install pytest            # unit only (fake adapter, no hermes-agent)
+pytest tests/unit -q
+
+pip install pytest aiohttp pyyaml python-dotenv   # functional too
+pytest -q
+```
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs both jobs on every push
+and PR:
+
+- **unit** — patch behaviour against a fake adapter;
+- **functional** — against the exact hermes-agent commit pinned in the
+  "Tested against" line above. If that line goes stale, the functional job
+  fails at ref resolution — freshness is enforced mechanically;
+- **drift** (weekly, Monday) — the same functional suite against
+  hermes-agent `main`, to catch upstream interface changes early.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Sébastien Coget (blt909).

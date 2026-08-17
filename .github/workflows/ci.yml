@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly drift check against hermes-agent main (Monday 03:00 UTC).
+    - cron: "0 3 * * 1"
+
+jobs:
+  unit:
+    name: Unit tests (fake adapter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install pytest
+      - name: Test
+        run: pytest tests/unit -q
+
+  functional:
+    name: Functional tests (real hermes-agent adapter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Single source of truth: the README "Tested against" line drives the
+      # exact hermes-agent commit under test. A stale/missing SHA fails here.
+      - name: Resolve tested hermes-agent ref from README
+        id: ref
+        run: |
+          SHA=$(sed -nE 's/.*commit `([0-9a-f]{7,40})` .*/\1/p' README.md | head -1)
+          if [ -z "$SHA" ]; then
+            echo "::error::README.md 'Tested against Hermes Agent commit <sha>' is missing or unparseable — refresh it."
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Checkout hermes-agent at tested ref
+        env:
+          HERMES_HOME: ${{ github.workspace }}/hermes-home
+        run: |
+          git clone --quiet --no-checkout --no-tags \
+            https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent"
+          git -C "$HERMES_HOME/hermes-agent" fetch --quiet --depth 1 origin "${{ steps.ref.outputs.sha }}"
+          git -C "$HERMES_HOME/hermes-agent" checkout --quiet "${{ steps.ref.outputs.sha }}"
+      - name: Install deps
+        run: pip install pytest aiohttp pyyaml python-dotenv
+      - name: Test
+        env:
+          HERMES_HOME: ${{ github.workspace }}/hermes-home
+          PYTHONPATH: ${{ github.workspace }}/hermes-home/hermes-agent
+        run: pytest tests/functional -q
+
+  drift:
+    name: Drift check (hermes-agent @ main)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Checkout hermes-agent main
+        env:
+          HERMES_HOME: ${{ github.workspace }}/hermes-home
+        run: |
+          git clone --quiet --depth 1 \
+            https://github.com/NousResearch/hermes-agent.git "$HERMES_HOME/hermes-agent"
+      - name: Install deps
+        run: pip install pytest aiohttp pyyaml python-dotenv
+      - name: Test
+        env:
+          HERMES_HOME: ${{ github.workspace }}/hermes-home
+          PYTHONPATH: ${{ github.workspace }}/hermes-home/hermes-agent
+        run: pytest tests/functional -q
+      - name: Report drift
+        if: failure()
+        run: |
+          echo "::warning::hermes-agent @ main drifted: interface or behaviour changed."
+          echo "Update README 'Tested against' and bump the plugin version if needed."
