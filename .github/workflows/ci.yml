@@ -6,8 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Weekly drift check against hermes-agent main (Monday 03:00 UTC).
-    - cron: "0 3 * * 1"
+    # Daily drift check against hermes-agent main (03:00 UTC). Green -> the
+    # drift job opens a pre-verified PR advancing the README pin.
+    - cron: "0 3 * * *"
 
 jobs:
   unit:
@@ -98,6 +99,43 @@ jobs:
           HERMES_HOME: ${{ github.workspace }}/hermes-home
           PYTHONPATH: ${{ github.workspace }}/hermes-home/hermes-agent
         run: pytest tests/functional -q
+      - name: Open auto-update PR when the tested ref is behind main
+        if: success()
+        env:
+          HERMES_HOME: ${{ github.workspace }}/hermes-home
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_SHA=$(git -C "$HERMES_HOME/hermes-agent" rev-parse HEAD)
+          NEW_SHORT=${NEW_SHA:0:8}
+          CUR=$(sed -nE 's/.*commit `([0-9a-f]{40})` .*/\1/p' README.md | head -1)
+          echo "current pin: $CUR"
+          echo "main head:   $NEW_SHA"
+          if [ -z "$CUR" ]; then
+            echo "::error::README 'Tested against' SHA missing — cannot auto-advance."
+            exit 1
+          fi
+          if [ "$CUR" = "$NEW_SHA" ]; then
+            echo "Already current — no PR needed."
+            exit 0
+          fi
+          BRANCH="chore/advance-tested-against-$NEW_SHORT"
+          if gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' | grep -q .; then
+            echo "PR for $BRANCH already open."
+            exit 0
+          fi
+          git config user.name "hermes-kchat bot"
+          git config user.email "1004773+blt909@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          # Only touch the "Tested against" line; the SHA is hex so it is
+          # safe inside double quotes (no backticks involved).
+          sed -i -E "/Tested against/ s/[0-9a-f]{40}/$NEW_SHA/" README.md
+          grep -q "$NEW_SHA" README.md || { echo "::error::README pin not replaced"; exit 1; }
+          git add README.md
+          git commit -m "chore: advance tested-against to $NEW_SHA"
+          git push -u origin "$BRANCH"
+          gh pr create --title "chore: advance tested-against to $NEW_SHORT" \
+            --body "Daily drift check passed against hermes-agent @ \`$NEW_SHA\`. This PR moves the 'Tested against' pin; CI on this PR re-verifies the same commit." \
+            --base main --head "$BRANCH"
       - name: Report drift
         if: failure()
         run: |
