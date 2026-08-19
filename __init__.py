@@ -53,6 +53,11 @@ v1.0.3: no runtime changes — repository tooling only. Adds the test suite
 (unit + functional, incl. the loader-eviction regression test), GitHub
 Actions CI (unit, functional against the README-pinned hermes-agent commit,
 daily drift with auto-PR), and the update watcher.
+
+v1.0.4: no runtime changes — advance the tested-against pin to
+ab173e26d2aa0300f22f5a5944c0284d732cfa8f (hermes-agent v0.20.4) after the
+2026-08-19 `hermes update`. Verified green (13/13 tests) and live on kChat
+(polling fallback engaged in gateway logs).
 """
 
 import asyncio
