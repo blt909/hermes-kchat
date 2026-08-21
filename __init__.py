@@ -58,6 +58,12 @@ v1.0.4: no runtime changes — advance the tested-against pin to
 ab173e26d2aa0300f22f5a5944c0284d732cfa8f (hermes-agent v0.20.4) after the
 2026-08-19 `hermes update`. Verified green (13/13 tests) and live on kChat
 (polling fallback engaged in gateway logs).
+
+v1.0.5: no runtime changes — advance the tested-against pin to
+fc9cbc872d8050c22f1192b16bc5ff4aed471e10 (hermes-agent v2026.8.18+,
+post-2026-08-21 update) after re-testing against the new adapter. Verified
+green (13/13 tests), all patched interfaces present, and live on kChat
+(WS 404 → REST polling fallback engaged in gateway logs after restart).
 """
 
 import asyncio
