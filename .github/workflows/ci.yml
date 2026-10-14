@@ -62,7 +62,12 @@ jobs:
           done
           exit 1
       - name: Install deps
-        run: pip install pytest aiohttp pyyaml python-dotenv
+        run: |
+          # ruamel.yaml is required by hermes-agent's own import chain
+          # (hermes_cli.plugins_manifest falls back to it; the adapter imports
+          # it transitively). Without it the adapter cannot be imported and
+          # every functional test fails with ModuleNotFoundError: ruamel.
+          pip install pytest aiohttp pyyaml python-dotenv ruamel.yaml
       - name: Test
         env:
           HERMES_HOME: ${{ github.workspace }}/hermes-home
@@ -93,7 +98,10 @@ jobs:
           done
           exit 1
       - name: Install deps
-        run: pip install pytest aiohttp pyyaml python-dotenv
+        run: |
+          # Same dep set as the functional job — ruamel.yaml included, see the
+          # note there (hermes-agent's adapter import chain needs it).
+          pip install pytest aiohttp pyyaml python-dotenv ruamel.yaml
       - name: Test
         env:
           HERMES_HOME: ${{ github.workspace }}/hermes-home
