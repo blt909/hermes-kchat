@@ -34,6 +34,15 @@ the corresponding patch detects it and leaves the module untouched.
   (`MATTERMOST_URL`, `MATTERMOST_TOKEN`, …). This plugin **patches** that
   adapter at runtime — it does not bundle a copy of it.
 
+The adapter is located **by file** (`plugins/platforms/mattermost/adapter.py`)
+and the patches are re-applied after every import of it, whatever Python module
+name the loader gives it. `hermes-agent` changed that name once already
+(`hermes_plugins.mattermost_platform` → `hermes_plugins.platforms__mattermost`
+after the 2026-10-09 update, when the loader moved to path-derived plugin
+keys) — the plugin version 1.0.9 fix exists precisely because a hardcoded name
+made it patch a dead module object, silently disabling both patches on the live
+gateway.
+
 ## Installation
 
 ### Option 1 — `hermes plugins install` (recommended)
@@ -86,7 +95,7 @@ global home channel (each cron job targets its own channel via
 
 ## Compatibility
 
-Tested against Hermes Agent commit `36842e639a178741b70c821e0f4cdd129cd0dfe3` (after v2026.9.14, September 2026). The patches are
+Tested against Hermes Agent commit `c5fc0958b49f415041c7f356c8bdf9f914037e89` (v0.22.0, October 2026). The patches are
 fail-open, but the adapter's method names can change across versions — if a
 Hermes update changes the adapter, re-test.
 

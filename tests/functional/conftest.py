@@ -9,10 +9,17 @@ environment must never turn CI red; only real regressions do.
 """
 
 import sys
+from pathlib import Path
 
 import pytest
 
-from helpers import HERMES_AGENT_ROOT
+from helpers import (
+    HERMES_AGENT_ROOT,
+    MODULE_NAME,
+    PKG_NAME,
+    SLUG_MODULE_NAME,
+    SLUG_PKG_NAME,
+)
 
 if HERMES_AGENT_ROOT is not None and str(HERMES_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(HERMES_AGENT_ROOT))
@@ -31,6 +38,13 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
+# Both namespaces the loader has used for the bundled platform plugin, as real
+# importable packages on sys.path (see helpers.py for the naming history).
+_PKG_SOURCES = (
+    (SLUG_PKG_NAME, "from .adapter import register\n"),
+    (PKG_NAME, ""),
+)
+
 
 @pytest.fixture
 def real_env(tmp_path, monkeypatch):
@@ -38,25 +52,27 @@ def real_env(tmp_path, monkeypatch):
 
     1. ``tmp_path/hermes-agent`` symlink — for the plugin's
        ``_load_adapter_module`` path resolution ($HERMES_HOME layout).
-    2. A real ``tmp_path/hermes_plugins/mattermost_platform`` package on
-       ``sys.path`` (adapter.py symlinked) — so a purge of the platform slug
-       from ``sys.modules`` can be re-imported through the normal import
-       machinery, exactly like the gateway's plugin loader does.
+    2. Real ``tmp_path/hermes_plugins/<slug>`` packages on ``sys.path``
+       (``adapter.py`` symlinked) — so a purge of the platform slug from
+       ``sys.modules`` can be re-imported through the normal import
+       machinery, exactly like the gateway's plugin loader does, under either
+       the path-derived name (``platforms__mattermost``) or the legacy one
+       (``mattermost_platform``).
     """
     assert HERMES_AGENT_ROOT is not None
     link = tmp_path / "hermes-agent"
     link.symlink_to(HERMES_AGENT_ROOT, target_is_directory=True)
 
-    pkg = tmp_path / "hermes_plugins" / "mattermost_platform"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("")
-    (pkg / "adapter.py").symlink_to(
-        HERMES_AGENT_ROOT / "plugins" / "platforms" / "mattermost" / "adapter.py"
-    )
+    adapter_py = HERMES_AGENT_ROOT / "plugins" / "platforms" / "mattermost" / "adapter.py"
+    for pkg_name, init_source in _PKG_SOURCES:
+        pkg = tmp_path.joinpath(*pkg_name.split("."))
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(init_source)
+        (pkg / "adapter.py").symlink_to(adapter_py)
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.syspath_prepend(str(tmp_path))
     # Fresh import state so the plugin (re)loads the real adapter next time.
-    sys.modules.pop("hermes_plugins.mattermost_platform.adapter", None)
-    sys.modules.pop("hermes_plugins.mattermost_platform", None)
+    for name in (MODULE_NAME, PKG_NAME, SLUG_MODULE_NAME, SLUG_PKG_NAME):
+        sys.modules.pop(name, None)
     return link

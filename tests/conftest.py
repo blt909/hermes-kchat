@@ -19,6 +19,8 @@ from helpers import (
     FAKE_NO_PROPS_SRC,
     MODULE_NAME,
     PKG_NAME,
+    SLUG_MODULE_NAME,
+    SLUG_PKG_NAME,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,9 +50,10 @@ def fake_adapter_env(plugin, tmp_path, monkeypatch):
         (pkg / "__init__.py").write_text("")
         (pkg / "adapter.py").write_text(source)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        # Force a fresh load of the adapter from this tmp dir on next register().
-        sys.modules.pop(MODULE_NAME, None)
-        sys.modules.pop(PKG_NAME, None)
+        # Force a fresh load of the adapter from this tmp dir on next register(),
+        # under either namespace the loader may have used.
+        for name in (MODULE_NAME, PKG_NAME, SLUG_MODULE_NAME, SLUG_PKG_NAME):
+            sys.modules.pop(name, None)
         return pkg
 
     return _plant

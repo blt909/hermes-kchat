@@ -6,7 +6,13 @@ import sys
 
 import pytest
 
-from helpers import FAKE_ADAPTER_SRC, FAKE_NO_CLASS_SRC, FAKE_NO_PROPS_SRC, MODULE_NAME
+from helpers import (
+    FAKE_ADAPTER_SRC,
+    FAKE_NO_CLASS_SRC,
+    FAKE_NO_PROPS_SRC,
+    SLUG_MODULE_NAME,
+    adapter_module,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,52 +45,64 @@ def test_noop_does_not_inject_disable_mentions(plugin):
 
 
 def test_register_applies_props_patch(plugin, fake_adapter_env):
-    fake_adapter_env(FAKE_ADAPTER_SRC)
+    pkg = fake_adapter_env(FAKE_ADAPTER_SRC)
     plugin.register(None)
-    adapter = sys.modules.get(MODULE_NAME)
-    assert adapter is not None
+    adapter = adapter_module(pkg)
     assert adapter._hermes_kchat_props_patched is True
     assert getattr(adapter._with_mentions_disabled, "_hermes_kchat_noop", False)
 
 
 def test_register_applies_polling_patches(plugin, fake_adapter_env):
-    fake_adapter_env(FAKE_ADAPTER_SRC)
+    pkg = fake_adapter_env(FAKE_ADAPTER_SRC)
     plugin.register(None)
-    cls = sys.modules[MODULE_NAME].MattermostAdapter
+    cls = adapter_module(pkg).MattermostAdapter
     assert cls._hermes_kchat_polling_patched is True
     assert cls._hermes_kchat_ws_connect_patched is True
     assert cls._ws_loop.__name__ == "_ws_loop_patched"
     assert cls._ws_connect_and_listen.__name__ == "_ws_connect_and_listen_patched"
 
 
-def test_register_idempotent(plugin, fake_adapter_env):
-    fake_adapter_env(FAKE_ADAPTER_SRC)
+def test_register_uses_loader_namespace(plugin, fake_adapter_env):
+    """v1.0.9: the pre-import lands under the loader's path-derived name.
+
+    hermes-agent >= 0.22 names the bundled platform plugin after its
+    path-derived manifest key, so ``hermes_plugins.platforms__mattermost`` is
+    the namespace the gateway's own import will reuse.
+    """
+    pkg = fake_adapter_env(FAKE_ADAPTER_SRC)
     plugin.register(None)
-    cls = sys.modules[MODULE_NAME].MattermostAdapter
+    assert SLUG_MODULE_NAME in sys.modules
+    assert sys.modules[SLUG_MODULE_NAME] is adapter_module(pkg)
+
+
+def test_register_idempotent(plugin, fake_adapter_env):
+    pkg = fake_adapter_env(FAKE_ADAPTER_SRC)
+    plugin.register(None)
+    adapter = adapter_module(pkg)
+    cls = adapter.MattermostAdapter
     patched_loop = cls._ws_loop
     patched_connect = cls._ws_connect_and_listen
-    adapter = sys.modules[MODULE_NAME]
 
     plugin.register(None)  # second register must be a no-op
 
-    assert sys.modules[MODULE_NAME] is adapter
+    assert adapter_module(pkg) is adapter
     assert cls._ws_loop is patched_loop  # not wrapped a second time
     assert cls._ws_connect_and_listen is patched_connect
 
 
 def test_register_fail_open_missing_props(plugin, fake_adapter_env):
-    fake_adapter_env(FAKE_NO_PROPS_SRC)
+    pkg = fake_adapter_env(FAKE_NO_PROPS_SRC)
     plugin.register(None)  # must not raise
-    adapter = sys.modules[MODULE_NAME]
+    adapter = adapter_module(pkg)
     # props patch skipped quietly; polling still armed on the class
     assert not getattr(adapter, "_hermes_kchat_props_patched", False)
     assert adapter.MattermostAdapter._hermes_kchat_polling_patched is True
 
 
 def test_register_fail_open_missing_class(plugin, fake_adapter_env):
-    fake_adapter_env(FAKE_NO_CLASS_SRC)
+    pkg = fake_adapter_env(FAKE_NO_CLASS_SRC)
     plugin.register(None)  # must not raise
-    adapter = sys.modules[MODULE_NAME]
+    adapter = adapter_module(pkg)
     assert adapter._hermes_kchat_props_patched is True
     assert not getattr(adapter, "MattermostAdapter", None)
 
