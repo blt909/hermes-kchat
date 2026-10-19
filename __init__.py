@@ -101,6 +101,15 @@ matches any ``hermes_plugins.*.adapter`` whose spec origin is that file, so
 the plugin no longer depends on the namespace upstream picks. Module-name
 candidates are derived from the plugin path for the pre-import case. Tested
 against Hermes Agent c5fc0958b49f415041c7f356c8bdf9f914037e89 (v0.22.0).
+
+v1.0.10: no runtime changes — advance the tested-against pin to
+d923a5eb487a17c0a68801bba9ef0f56c81040a8 (hermes-agent v0.22.2, the first
+release on the new v0.22.x versioning scheme; 2068 commits past the previous
+pin). Re-verified against the new adapter: the offline replay probe passes
+(patch applied in every namespace — platforms__mattermost,
+mattermost_platform and the profile-scoped variant — with a synthetic 404
+handing off to REST polling), 17/17 tests green, and the live gateway shows
+REST polling armed with zero native WS 404 loop lines after restart.
 """
 
 import asyncio
