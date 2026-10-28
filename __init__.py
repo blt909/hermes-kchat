@@ -110,6 +110,14 @@ pin). Re-verified against the new adapter: the offline replay probe passes
 mattermost_platform and the profile-scoped variant — with a synthetic 404
 handing off to REST polling), 17/17 tests green, and the live gateway shows
 REST polling armed with zero native WS 404 loop lines after restart.
+
+v1.0.11: no runtime changes — advance the tested-against pin to
+bf0203a794a07aac3ff764972ab9087baa4e4f4e (hermes-agent v0.22.5) after
+re-testing against the new adapter. Verified green: 17/17 tests, the offline
+replay probe patches every namespace (platforms__mattermost,
+mattermost_platform, profile-scoped) and confirms the 404 → REST polling
+handoff, and the live gateway arms the fallback with zero native WS 404 loop
+lines after restart.
 """
 
 import asyncio
